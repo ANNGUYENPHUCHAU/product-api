@@ -126,6 +126,7 @@ jobs:
           echo "$RESPONSE"
 
           echo "$RESPONSE" | grep -q '"message":"Product deleted successfully"'
+
       - name: Verify Product deleted
         run: |
           STATUS=$(curl -s \
@@ -139,6 +140,8 @@ jobs:
             echo "Expected HTTP 404 but received $STATUS"
             exit 1
           fi
+
+          grep -q '"message":"Product not found"' delete-check.json
 
       - name: Show Docker status
         if: always()
@@ -180,3 +183,108 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/product-api:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/product-api:${{ github.sha }}
+
+  deploy-local:
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+
+    needs:
+      - integration-test
+      - dockerhub-push
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Create production environment file
+        shell: pwsh
+        run: |
+          @"
+          PORT=3000
+          MONGO_URI=mongodb://nammongodb:27017/productdb
+          "@ | Set-Content -Path .env
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull latest production image
+        shell: pwsh
+        run: |
+          docker compose -f docker-compose-prod.yaml pull
+
+      - name: Deploy to local Docker Engine
+        shell: pwsh
+        run: |
+          docker compose -f docker-compose-prod.yaml up -d
+
+      - name: Wait for local healthchecks
+        shell: pwsh
+        run: |
+          Write-Host "Waiting for local deployment..."
+
+          for ($i = 1; $i -le 30; $i++) {
+            $mongo = docker inspect --format='{{.State.Health.Status}}' nammongodb 2>$null
+            $api = docker inspect --format='{{.State.Health.Status}}' product-api-container 2>$null
+
+            if (-not $mongo) {
+              $mongo = "starting"
+            }
+
+            if (-not $api) {
+              $api = "starting"
+            }
+
+            Write-Host "MongoDB: $mongo | Product API: $api"
+
+            if ($mongo -eq "healthy" -and $api -eq "healthy") {
+              Write-Host "Local deployment is healthy."
+              exit 0
+            }
+
+            Start-Sleep -Seconds 2
+          }
+
+          Write-Host "Local deployment healthcheck failed."
+          docker compose -f docker-compose-prod.yaml ps
+          docker compose -f docker-compose-prod.yaml logs
+          exit 1
+
+      - name: Verify deployed image
+        shell: pwsh
+        run: |
+          $image = docker inspect product-api-container --format='{{.Config.Image}}'
+
+          Write-Host "Running image: $image"
+
+          if ($image -ne "${{ secrets.DOCKERHUB_USERNAME }}/product-api:latest") {
+            Write-Host "Unexpected production image."
+            exit 1
+          }
+
+      - name: Test local health endpoint
+        shell: pwsh
+        run: |
+          $response = Invoke-RestMethod -Uri "http://localhost:3000/health"
+
+          $response | ConvertTo-Json
+
+          if ($response.status -ne "healthy") {
+            throw "Product API is not healthy."
+          }
+
+          if ($response.mongodb -ne "connected") {
+            throw "MongoDB is not connected."
+          }
+
+      - name: Show production status
+        if: always()
+        shell: pwsh
+        run: |
+          docker compose -f docker-compose-prod.yaml ps
