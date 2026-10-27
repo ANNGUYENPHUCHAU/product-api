@@ -32,8 +32,13 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Run product tests1
+        run: npm test
+        
       - name: Run Product tests
         run: npm test
+
       - name: Check server syntax
         run: node --check server.js
 
